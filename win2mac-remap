@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP="win2mac-remap"
+LABEL="com.user.win2mac-remap"
+
+INSTALL_DIR="$HOME/.local/bin"
+INSTALL_PATH="$INSTALL_DIR/$APP"
+
+CONFIG_DIR="$HOME/.config/$APP"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_FILE="$PLIST_DIR/$LABEL.plist"
+
+LOG_DIR="$HOME/Library/Logs"
+OUT_LOG="$LOG_DIR/$APP.log"
+ERR_LOG="$LOG_DIR/$APP.err.log"
+
+MODE="swap-alt-cmd"
+MATCH_JSON=""
+INTERVAL="60"
+QUIET="0"
+
+usage() {
+  cat <<EOF
+$APP - Windows keyboard remap for macOS
+
+Default remap:
+  Windows key -> Option
+  Alt key     -> Command
+
+Commands:
+  install        Install script, LaunchAgent, and apply remap now
+  update         Update installed script and reload LaunchAgent
+  apply          Apply/remedy remap now
+  status         Show install status and active hidutil mapping
+  reset          Clear current hidutil remap
+  uninstall      Remove LaunchAgent, clear remap, remove installed script
+  devices        Show HID devices to help find keyboard VendorID/ProductID
+  help           Show this help
+
+Options:
+  --global
+      Apply remap globally to all keyboards. This is default.
+
+  --match '<json>'
+      Apply remap only to a matching HID device.
+      Example:
+      $APP install --match '{"VendorID":0x046D,"ProductID":0xC31C}'
+
+  --interval 60
+      Reapply interval in seconds for LaunchAgent. Default: 60.
+
+  --quiet
+      Reduce output.
+
+Examples:
+  ./$APP install
+  $APP status
+  $APP reset
+  $APP uninstall
+
+EOF
+}
+
+log() {
+  if [[ "$QUIET" != "1" ]]; then
+    printf '%s\n' "$*"
+  fi
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+need_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "This script is for macOS only."
+  command -v hidutil >/dev/null 2>&1 || die "hidutil not found. This should exist on macOS."
+}
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+
+  MODE="${MODE:-swap-alt-cmd}"
+  MATCH_JSON="${MATCH_JSON:-}"
+  INTERVAL="${INTERVAL:-60}"
+}
+
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+
+  {
+    printf 'MODE=%q\n' "$MODE"
+    printf 'MATCH_JSON=%q\n' "$MATCH_JSON"
+    printf 'INTERVAL=%q\n' "$INTERVAL"
+  } > "$CONFIG_FILE"
+}
+
+parse_options() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --quiet)
+        QUIET="1"
+        shift
+        ;;
+      --global)
+        MATCH_JSON=""
+        shift
+        ;;
+      --match|--matching)
+        [[ $# -ge 2 ]] || die "--match requires JSON, for example: '{\"VendorID\":0x046D,\"ProductID\":0xC31C}'"
+        MATCH_JSON="$2"
+        shift 2
+        ;;
+      --interval)
+        [[ $# -ge 2 ]] || die "--interval requires seconds."
+        INTERVAL="$2"
+        [[ "$INTERVAL" =~ ^[0-9]+$ ]] || die "--interval must be a number."
+        [[ "$INTERVAL" -ge 15 ]] || die "--interval should be at least 15 seconds."
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+mapping_json() {
+  cat <<'JSON'
+{"UserKeyMapping":[
+  {"HIDKeyboardModifierMappingSrc":0x7000000E2,"HIDKeyboardModifierMappingDst":0x7000000E3},
+  {"HIDKeyboardModifierMappingSrc":0x7000000E3,"HIDKeyboardModifierMappingDst":0x7000000E2},
+  {"HIDKeyboardModifierMappingSrc":0x7000000E6,"HIDKeyboardModifierMappingDst":0x7000000E7},
+  {"HIDKeyboardModifierMappingSrc":0x7000000E7,"HIDKeyboardModifierMappingDst":0x7000000E6}
+]}
+JSON
+}
+
+hidutil_set() {
+  local json="$1"
+
+  if [[ -n "$MATCH_JSON" ]]; then
+    hidutil property --matching "$MATCH_JSON" --set "$json"
+  else
+    hidutil property --set "$json"
+  fi
+}
+
+hidutil_get() {
+  if [[ -n "$MATCH_JSON" ]]; then
+    hidutil property --matching "$MATCH_JSON" --get UserKeyMapping
+  else
+    hidutil property --get UserKeyMapping
+  fi
+}
+
+apply_mapping() {
+  need_macos
+
+  local output
+  if output="$(hidutil_set "$(mapping_json)" 2>&1)"; then
+    log "Applied Windows keyboard remap."
+    [[ -n "$MATCH_JSON" ]] && log "Target match: $MATCH_JSON"
+    return 0
+  fi
+
+  printf '%s\n' "$output" >&2
+  die "hidutil failed. Try System Settings > Privacy & Security > Input Monitoring and allow Terminal/iTerm, then run again."
+}
+
+reset_mapping() {
+  need_macos
+
+  local output
+  if output="$(hidutil_set '{"UserKeyMapping":[]}' 2>&1)"; then
+    log "Cleared keyboard remap."
+    return 0
+  fi
+
+  printf '%s\n' "$output" >&2
+  die "Failed to clear remap."
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
+
+write_plist() {
+  mkdir -p "$PLIST_DIR" "$LOG_DIR"
+
+  local install_path_xml out_log_xml err_log_xml
+  install_path_xml="$(xml_escape "$INSTALL_PATH")"
+  out_log_xml="$(xml_escape "$OUT_LOG")"
+  err_log_xml="$(xml_escape "$ERR_LOG")"
+
+  cat > "$PLIST_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>$install_path_xml</string>
+    <string>apply</string>
+    <string>--quiet</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>$INTERVAL</integer>
+
+  <key>StandardOutPath</key>
+  <string>$out_log_xml</string>
+
+  <key>StandardErrorPath</key>
+  <string>$err_log_xml</string>
+</dict>
+</plist>
+EOF
+}
+
+load_agent() {
+  launchctl bootout "gui/$UID" "$PLIST_FILE" >/dev/null 2>&1 || true
+
+  if launchctl bootstrap "gui/$UID" "$PLIST_FILE" >/dev/null 2>&1; then
+    log "LaunchAgent loaded."
+  else
+    launchctl unload "$PLIST_FILE" >/dev/null 2>&1 || true
+    launchctl load "$PLIST_FILE" >/dev/null 2>&1 || die "Could not load LaunchAgent."
+    log "LaunchAgent loaded using legacy launchctl load."
+  fi
+}
+
+unload_agent() {
+  launchctl bootout "gui/$UID" "$PLIST_FILE" >/dev/null 2>&1 || \
+  launchctl unload "$PLIST_FILE" >/dev/null 2>&1 || true
+}
+
+install_self() {
+  need_macos
+
+  mkdir -p "$INSTALL_DIR"
+
+  local source_path
+  source_path="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd -P 2>/dev/null)/$(basename "${BASH_SOURCE[0]:-}" 2>/dev/null)"
+
+  if [[ -f "$source_path" && "$source_path" != "$INSTALL_PATH" ]]; then
+    # Running from a local file — copy it
+    cp "$source_path" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+  else
+    # Running via stdin (curl | bash) or updating — download from GitHub via temp file
+    local tmp="/tmp/$APP.$$"
+    curl -fsSL "https://raw.githubusercontent.com/maximpri/win2mac-remap/main/win2mac-remap" -o "$tmp" || die "Failed to download script from GitHub."
+    mv "$tmp" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+  fi
+}
+
+install_all() {
+  [[ "$INTERVAL" =~ ^[0-9]+$ ]] || die "INTERVAL must be numeric."
+
+  install_self
+  save_config
+  write_plist
+  load_agent
+  apply_mapping
+
+  log ""
+  log "Installed successfully."
+  log "Command available as: $APP"
+  log "Installed path: $INSTALL_PATH"
+  log "LaunchAgent: $PLIST_FILE"
+}
+
+status() {
+  need_macos
+
+  echo "Script: $APP"
+  echo "Installed script: $INSTALL_PATH"
+  [[ -x "$INSTALL_PATH" ]] && echo "Installed: yes" || echo "Installed: no"
+
+  echo "LaunchAgent: $PLIST_FILE"
+  [[ -f "$PLIST_FILE" ]] && echo "LaunchAgent file: yes" || echo "LaunchAgent file: no"
+
+  if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+    echo "LaunchAgent loaded: yes"
+  else
+    echo "LaunchAgent loaded: no"
+  fi
+
+  echo "Mode: $MODE"
+  echo "Match JSON: ${MATCH_JSON:-global/all keyboards}"
+  echo "Reapply interval: ${INTERVAL}s"
+  echo ""
+  echo "Current hidutil mapping:"
+  hidutil_get || true
+}
+
+devices() {
+  need_macos
+  echo "HID devices:"
+  echo ""
+  hidutil list
+  echo ""
+  echo "Tip: look for your external keyboard, then use VendorID/ProductID with:"
+  echo "$APP install --match '{\"VendorID\":0xXXXX,\"ProductID\":0xYYYY}'"
+}
+
+uninstall_all() {
+  unload_agent
+  reset_mapping || true
+
+  rm -f "$PLIST_FILE"
+  rm -f "$INSTALL_PATH"
+  rm -rf "$CONFIG_DIR"
+
+  log "Uninstalled."
+}
+
+run_installer() {
+  local args=("$@")
+
+  cat <<'BANNER'
+┌────────────────────────────────────────┐
+│                                        │
+│   win2mac-remap                        │
+│   Windows keyboard → Mac remap         │
+│                                        │
+└────────────────────────────────────────┘
+BANNER
+
+  echo ""
+  echo "This script will:"
+  echo "  1. Install win2mac-remap to: $INSTALL_PATH"
+  echo "  2. Set up a LaunchAgent to persist the remap after reboot"
+  echo "  3. Apply the remap now (Windows key ↔ Option, Alt ↔ Command)"
+  echo ""
+  echo "Target:       ${MATCH_JSON:-all keyboards}"
+  echo "Re-apply:     every ${INTERVAL}s"
+  echo "LaunchAgent:  $PLIST_FILE"
+  echo ""
+  echo "You can uninstall anytime by running: $APP uninstall"
+  echo ""
+
+  local response
+  if [[ -t 0 ]]; then
+    read -rp "Proceed with installation? [Y/n] " response
+  else
+    # When piped (curl | bash), read from /dev/tty instead
+    # Use printf for prompt since read -p writes to stderr (hidden by 2>/dev/null)
+    printf "Proceed with installation? [Y/n] "
+    read response </dev/tty 2>/dev/null || {
+      echo "Assuming yes (no TTY available)."
+      response=""
+    }
+  fi
+  case "$response" in
+    [Nn]|[Nn][Oo])
+      echo "Installation cancelled."
+      exit 0
+      ;;
+    [Yy]|[Yy][Ee][Ss]|""|*)
+      : # proceed
+      ;;
+  esac
+
+  echo ""
+  install_all
+}
+
+COMMAND="${1:-install}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+load_config
+parse_options "$@"
+
+case "$COMMAND" in
+  install)
+    run_installer "$@"
+    ;;
+  update)
+    install_all
+    ;;
+  apply)
+    apply_mapping
+    ;;
+  status)
+    status
+    ;;
+  reset)
+    reset_mapping
+    ;;
+  uninstall)
+    uninstall_all
+    ;;
+  devices)
+    devices
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    die "Unknown command: $COMMAND"
+    ;;
+esac
